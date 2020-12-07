@@ -1,20 +1,48 @@
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE ViewPatterns #-}
+
 import Data.Char
 import Control.Applicative
 import Numeric
 import System.IO
 import Data.Map (Map, insert, fromList)
 
+data Input = Input
+    { inputLoc :: Int
+    , inputStr :: String
+    } deriving (Show, Eq)
+
+
+inputUncons :: Input -> Maybe (Char, Input)
+inputUncons (Input _ []) = Nothing
+inputUncons (Input loc (x:xs)) = Just (x, Input (loc + 1) xs)
+
+
+
 data JsonValue 
     = JsonNull
     | JsonBool Bool
-    | JsonNum Int
+    | JsonNum Double
     | JsonStr String
     | JsonArray [JsonValue]
     | JsonObject (Map String JsonValue)
     deriving(Show, Eq)
 
+
+
+data ParseError = ParseError Int String
+    deriving Show
+
+instance Alternative (Either ParseError) where
+    empty = Left $ ParseError 0 "empty"
+
+    Left _ <|> e2 = e2
+    e1 <|> _ = e1
+
+
+
 newtype Parser a = Parser {
-    runParser :: String -> Maybe (String, a) 
+    runParser :: Input -> Either ParseError (Input, a) 
 }
 
 
@@ -22,47 +50,48 @@ instance Functor Parser where
     fmap f (Parser p) =
         Parser $ \input -> do
             (input', x) <- p input
-            Just (input', f x)
+            pure (input', f x)
 
 
 instance Applicative Parser where
     -- pretend that Parser parsed x
-    pure x = Parser $ \input -> Just (input, x)
+    pure x = Parser $ \input -> Right (input, x)
 
     -- (<*>) :: Applicative f => f (a -> b) -> f a -> f b
-    (<*>) (Parser p1) (Parser p2) =
+    (Parser p1) <*> (Parser p2) =
         Parser $ \input -> do
             (input', f) <- p1 input
             (input'', a) <- p2 input'
-            Just (input'', f a)
+            pure (input'', f a)
 
 
 instance Alternative Parser where
     -- parser that always fails
-    empty = Parser $ \_ -> Nothing
+    empty = Parser $ const empty
 
     -- try parser p1 if it fails try parser p2
-    (<|>) (Parser p1) (Parser p2) = Parser $ \input -> p1 input <|> p2 input
+    Parser p1 <|> Parser p2 = Parser $ \input -> p1 input <|> p2 input
 
 
 -- parse char if pred holds
-parseIf :: (Char -> Bool) -> Parser Char
-parseIf f = Parser g 
-    where
-        g (x:xs) = if f x
-            then Just (xs, x)
-            else Nothing
-        g [] = Nothing
+parseIf :: String -> (Char -> Bool) -> Parser Char
+parseIf descr f = Parser $ \input ->
+    case input of
+        (inputUncons -> Just (y, ys))
+            | f y -> Right (ys, y)
+            | otherwise -> Left $ ParseError (inputLoc input) ("Expected " ++ descr ++ ", but found '" ++ [y] ++ "'")
+
+        _ -> Left $ ParseError (inputLoc input) ("Expected " ++ descr ++ ", but reached end of string")
 
 
 -- split input into part where pred holds and part where it does not
-spanP :: (Char -> Bool) -> Parser String
-spanP = many . parseIf
+spanP :: String -> (Char -> Bool) -> Parser String
+spanP descr = many . parseIf descr
 
 
 -- whitespace parser
 ws :: Parser String
-ws = spanP isSpace
+ws = spanP "whitespace" isSpace
 
 
 -- elements seperated by some seperator example: 1,2,3
@@ -76,11 +105,11 @@ stringLiteral = charP '"' *> many (normalChar <|> escapeChar) <* charP '"'
 
 
 normalChar :: Parser Char
-normalChar = parseIf (\ch -> ch /= '"' && ch /= '\\')
+normalChar = parseIf "non-special char" (\ch -> ch /= '"' && ch /= '\\')
 
 
 escapeUnicode :: Parser Char
-escapeUnicode = chr . fst . head . readHex <$> sequenceA (replicate 4 (parseIf isHexDigit))
+escapeUnicode = chr . fst . head . readHex <$> sequenceA (replicate 4 (parseIf "hex digit" isHexDigit))
 
 
 escapeChar :: Parser Char
@@ -99,10 +128,28 @@ escapeChar = ('"' <$ strP "\\\"") <|>
 charP :: Char -> Parser Char
 charP c = Parser f
     where
-        f (x:xs) = if x == c
-            then Just (xs, x)
-            else Nothing 
-        f [] = Nothing
+        f input@(inputUncons -> Just (x,xs))
+            | x == c    = Right (xs, x)
+            | otherwise = Left $ ParseError (inputLoc input) ("Expected '" ++ [c] ++ "', but found '" ++ [x] ++ "'")
+
+        f input = Left $ ParseError (inputLoc input) ("Expected '" ++ [c] ++ "', but reached end of string")
+
+
+doubleFromParts :: Integer -> Integer -> Double -> Integer -> Double
+doubleFromParts sign int dec exp = fromInteger sign * (fromIntegral int + dec) * (10 ^^ exp)
+
+
+doubleP :: Parser Double
+doubleP = doubleFromParts
+    <$> (minus <|> pure 1) -- sign
+    <*> (read <$> digits)  -- integral part
+    <*> ((read <$> (('0':) <$> ((:) <$> charP '.' <*> digits))) <|> pure 0) -- decimal part
+    <*> ((e *> ((*) <$> (plus <|> minus <|> pure 1) <*> (read <$> digits))) <|> pure 0) -- exponent
+    where
+        minus = (-1) <$ charP '-'
+        plus = 1 <$ charP '+'
+        e = charP 'e' <|> charP 'E'
+        digits = some $ parseIf "digit" isDigit
 
 
 -- parses single defined string
@@ -126,17 +173,7 @@ jsonStrParser = JsonStr <$> stringLiteral
 
 
 jsonNumParser :: Parser JsonValue
-jsonNumParser = Parser (f 0)
-    where
-        digitAdd = \acc cur -> (acc * 10) + cur
-
-        f :: Int -> String -> Maybe (String, JsonValue)
-        f _ [] = Nothing
-        f acc input = let 
-            (num, rest) = (span isDigit input) in
-                case map ((+) (- 48) . ord) num of
-                    [] -> Nothing
-                    list -> Just (rest, JsonNum (foldl digitAdd 0 list))
+jsonNumParser = JsonNum <$> doubleP
 
 
 jsonArrayParser :: Parser JsonValue
@@ -228,10 +265,16 @@ jsonValueParser = jsonNullParser
     <|> jsonObjectParser
 
 
-jsonParseFile :: String -> IO (Maybe (String, JsonValue))
+jsonParseString :: String -> Either ParseError JsonValue
+jsonParseString input = case runParser jsonValueParser $ Input 0 input of
+    Left e -> Left e
+    Right (_,x) -> Right x
+
+
+jsonParseFile :: String -> IO (Either ParseError JsonValue)
 jsonParseFile path = do
     content <- readFile path
-    return (runParser jsonValueParser content)
+    pure $ jsonParseString content
 
 
 main = undefined
